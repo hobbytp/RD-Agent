@@ -85,11 +85,13 @@ def normalize_volumes(vols: dict[str, str | dict[str, str]], working_dir: str) -
         if isinstance(vinfo, dict):
             # abs_vols = cast(dict[str, dict[str, str]], abs_vols)
             vinfo = vinfo.copy()
-            vinfo["bind"] = to_abs(vinfo["bind"])
-            abs_vols[lp] = vinfo
+            # Fix: Don't normalize container paths, only host paths
+            # Container paths should remain as-is (e.g., "/workspace/cache")
+            # Only normalize host paths (lp) to absolute paths
+            abs_vols[os.path.abspath(lp)] = vinfo
         else:
             # abs_vols = cast(dict[str, str], abs_vols)
-            abs_vols[lp] = to_abs(vinfo)
+            abs_vols[os.path.abspath(lp)] = vinfo
     return abs_vols
 
 
@@ -488,7 +490,9 @@ class LocalEnv(Env[ASpecificLocalConf]):
                 volumes[lp] = rp["bind"] if isinstance(rp, dict) else rp
             cache_path = "/tmp/sample" if "/sample/" in "".join(self.conf.extra_volumes.keys()) else "/tmp/full"
             Path(cache_path).mkdir(parents=True, exist_ok=True)
-            volumes[cache_path] = T("scenarios.data_science.share:scen.cache_path").r()
+            # Fix: Use proper container path for cache instead of Windows path
+            container_cache_path = "/workspace/cache"
+            volumes[cache_path] = container_cache_path
         for lp, rp in running_extra_volume.items():
             volumes[lp] = rp
 
@@ -505,15 +509,34 @@ class LocalEnv(Env[ASpecificLocalConf]):
                     if not link_path.parent.exists():
                         link_path.parent.mkdir(parents=True, exist_ok=True)
                     if link_path.exists() or link_path.is_symlink():
-                        link_path.unlink()
-                    link_path.symlink_to(real_path)
+                        if link_path.is_dir():
+                            import shutil
+                            shutil.rmtree(link_path)
+                        else:
+                            link_path.unlink()
+                    
+                    # On Windows, use copy instead of symlink to avoid permission issues
+                    import platform
+                    if platform.system() == "Windows":
+                        if real_path.is_dir():
+                            import shutil
+                            shutil.copytree(real_path, link_path)
+                        else:
+                            import shutil
+                            shutil.copy2(real_path, link_path)
+                    else:
+                        link_path.symlink_to(real_path)
                     created_links.append(link_path)
                 yield
             finally:
                 for p in created_links:
                     try:
                         if p.is_symlink() or p.exists():
-                            p.unlink()
+                            if p.is_dir():
+                                import shutil
+                                shutil.rmtree(p)
+                            else:
+                                p.unlink()
                     except FileNotFoundError:
                         pass
 
@@ -521,8 +544,12 @@ class LocalEnv(Env[ASpecificLocalConf]):
             # Setup environment
             if env is None:
                 env = {}
-            path = [*self.conf.bin_path.split(":"), "/bin/", "/usr/bin/", *env.get("PATH", "").split(":")]
-            env["PATH"] = ":".join(path)
+            import os as _os
+            _sep = _os.pathsep
+            _bin_parts = [p for p in (getattr(self.conf, "bin_path", "") or "").split(_sep) if p]
+            _extra = [] if _os.name == "nt" else ["/bin/", "/usr/bin/"]
+            _env_path = env.get("PATH", _os.environ.get("PATH", ""))
+            env["PATH"] = _sep.join([*_bin_parts, *_extra, _env_path])
 
             if entry is None:
                 entry = self.conf.default_entry
@@ -557,34 +584,84 @@ class LocalEnv(Env[ASpecificLocalConf]):
                 raise RuntimeError("The subprocess did not correctly create stdout/stderr pipes")
 
             if self.conf.live_output:
-                stdout_fd = process.stdout.fileno()
-                stderr_fd = process.stderr.fileno()
+                import platform
+                if platform.system() == "Windows":
+                    # Windows-compatible live output using threading
+                    import threading
+                    import queue
+                    
+                    output_queue = queue.Queue()
+                    combined_output = ""
+                    
+                    def read_stdout():
+                        for line in iter(process.stdout.readline, ""):
+                            output_queue.put(('stdout', line))
+                    
+                    def read_stderr():
+                        for line in iter(process.stderr.readline, ""):
+                            output_queue.put(('stderr', line))
+                    
+                    stdout_thread = threading.Thread(target=read_stdout)
+                    stderr_thread = threading.Thread(target=read_stderr)
+                    stdout_thread.daemon = True
+                    stderr_thread.daemon = True
+                    stdout_thread.start()
+                    stderr_thread.start()
+                    
+                    while process.poll() is None:
+                        try:
+                            output_type, output = output_queue.get(timeout=0.1)
+                            if output_type == 'stdout':
+                                combined_output += output
+                                Console().print(output.strip(), markup=False)
+                            elif output_type == 'stderr':
+                                combined_output += output
+                                Console().print(output.strip(), markup=False)
+                        except queue.Empty:
+                            continue
+                    
+                    # Read remaining output
+                    while not output_queue.empty():
+                        try:
+                            output_type, output = output_queue.get_nowait()
+                            if output_type == 'stdout':
+                                combined_output += output
+                                Console().print(output.strip(), markup=False)
+                            elif output_type == 'stderr':
+                                combined_output += output
+                                Console().print(output.strip(), markup=False)
+                        except queue.Empty:
+                            break
+                else:
+                    # Unix/Linux compatible live output using select.poll
+                    stdout_fd = process.stdout.fileno()
+                    stderr_fd = process.stderr.fileno()
 
-                poller = select.poll()
-                poller.register(stdout_fd, select.POLLIN)
-                poller.register(stderr_fd, select.POLLIN)
+                    poller = select.poll()
+                    poller.register(stdout_fd, select.POLLIN)
+                    poller.register(stderr_fd, select.POLLIN)
 
-                combined_output = ""
-                while True:
-                    if process.poll() is not None:
-                        break
-                    events = poller.poll(100)
-                    for fd, event in events:
-                        if event & select.POLLIN:
-                            if fd == stdout_fd:
-                                while True:
-                                    output = process.stdout.readline()
-                                    if output == "":
-                                        break
-                                    Console().print(output.strip(), markup=False)
-                                    combined_output += output
-                            elif fd == stderr_fd:
-                                while True:
-                                    error = process.stderr.readline()
-                                    if error == "":
-                                        break
-                                    Console().print(error.strip(), markup=False)
-                                    combined_output += error
+                    combined_output = ""
+                    while True:
+                        if process.poll() is not None:
+                            break
+                        events = poller.poll(100)
+                        for fd, event in events:
+                            if event & select.POLLIN:
+                                if fd == stdout_fd:
+                                    while True:
+                                        output = process.stdout.readline()
+                                        if output == "":
+                                            break
+                                        Console().print(output.strip(), markup=False)
+                                        combined_output += output
+                                elif fd == stderr_fd:
+                                    while True:
+                                        error = process.stderr.readline()
+                                        if error == "":
+                                            break
+                                        Console().print(error.strip(), markup=False)
+                                        combined_output += error
 
                 # Capture any final output
                 remaining_output, remaining_error = process.communicate()
@@ -700,7 +777,7 @@ class QlibDockerConf(DockerConf):
         env_parse_none_str="None",  # Nthis is the key to accept `RUNNING_TIMEOUT_PERIOD=None`
     )
 
-    build_from_dockerfile: bool = True
+    build_from_dockerfile: bool = False
     dockerfile_folder_path: Path = Path(__file__).parent.parent / "scenarios" / "qlib" / "docker"
     image: str = "local_qlib:latest"
     mount_path: str = "/workspace/qlib_workspace/"
@@ -895,7 +972,9 @@ class DockerEnv(Env[DockerConf]):
                 volumes[lp] = rp if isinstance(rp, dict) else {"bind": rp, "mode": self.conf.extra_volume_mode}
             cache_path = "/tmp/sample" if "/sample/" in "".join(self.conf.extra_volumes.keys()) else "/tmp/full"
             Path(cache_path).mkdir(parents=True, exist_ok=True)
-            volumes[cache_path] = {"bind": T("scenarios.data_science.share:scen.cache_path").r(), "mode": "rw"}
+            # Fix: Use proper container path for cache instead of Windows path
+            container_cache_path = "/workspace/cache"
+            volumes[cache_path] = {"bind": container_cache_path, "mode": "rw"}
         for lp, rp in running_extra_volume.items():
             volumes[lp] = rp if isinstance(rp, dict) else {"bind": rp, "mode": self.conf.extra_volume_mode}
 
@@ -961,9 +1040,15 @@ class QTDockerEnv(DockerEnv):
         """
         super().prepare()
         qlib_data_path = next(iter(self.conf.extra_volumes.keys()))
-        if not (Path(qlib_data_path) / "qlib_data" / "cn_data").exists():
-            logger.info("We are downloading!")
-            cmd = "python -m qlib.run.get_data qlib_data --target_dir ~/.qlib/qlib_data/cn_data --region cn --interval 1d --delete_old False"
+        qlib_data_dir = Path(qlib_data_path) / "qlib_data" / "cn_data"
+        
+        # Check if we have the required instruments directory and data files
+        instruments_dir = qlib_data_dir / "instruments"
+        has_instruments = instruments_dir.exists() and any(instruments_dir.iterdir())
+        
+        if not qlib_data_dir.exists() or not has_instruments:
+            logger.info("Qlib data is incomplete or missing. Downloading fresh data...")
+            cmd = "python -m qlib.run.get_data qlib_data --target_dir ~/.qlib/qlib_data/cn_data --region cn --interval 1d --delete_old True"
             self.check_output(entry=cmd)
         else:
             logger.info("Data already exists. Download skipped.")
